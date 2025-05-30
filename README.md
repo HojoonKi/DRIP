@@ -21,11 +21,10 @@ Stable Diffusion LoRA 기반 얼굴 identity preservation을 위한 훈련 코�
 
 ### 1. 도커 이미지 빌드
 
-```bash
-# 컨테이너 빌드 스크립트 실행
-bash build_container_drip.sh
+먼저 도커 이미지를 빌드합니다:
 
-# 또는 직접 빌드
+```bash
+# 도커 이미지 빌드
 docker build -t drip:latest .
 ```
 
@@ -53,8 +52,13 @@ dataset/
 
 ### 3. 컨테이너 실행
 
+이미지 빌드 완료 후 컨테이너를 실행합니다:
+
 ```bash
-# GPU를 사용한 컨테이너 실행
+# 컨테이너 실행 스크립트 사용
+bash build_container_drip.sh
+
+# 또는 직접 실행
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
     -v $(pwd)/dataset:/workspace/dataset \
