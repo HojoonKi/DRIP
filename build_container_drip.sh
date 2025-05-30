@@ -5,4 +5,5 @@ docker run -dit\
 	--ipc=host\
 	--user root\
 	--name drip\
-	drip:latest
+	drip:latest\
+	bash
