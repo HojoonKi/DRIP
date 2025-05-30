@@ -29,14 +29,17 @@
             torchreid==0.2.5 timm pillow einops \
             facenet-pytorch
     
-    # ---------- 6) 기본 환경 변수 ----------
+    # ---------- 6) Git 안전 디렉터리 설정 ----------
+    RUN git config --global --add safe.directory /workspace
+    
+    # ---------- 7) 기본 환경 변수 ----------
     ENV CONDA_DEFAULT_ENV=drip
     ENV PATH=/opt/conda/envs/drip/bin:$PATH
     
-    # ---------- 7) 작업 디렉터리 ----------
+    # ---------- 8) 작업 디렉터리 ----------
     WORKDIR /workspace
     
-    # ---------- 8) 기본 명령 ----------
+    # ---------- 9) 기본 명령 ----------
     # 필요시 스크립트로 교체하세요
     CMD ["python", "--version"]
     
