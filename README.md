@@ -1,6 +1,6 @@
 # DRIP
 
-**D**iffusion **R**e-**I**dentification with **P**ersonalization
+**D**iffusion with **R**e-Identification for **I**dentity-Preserving **P**ersonalized Generation
 
 Stable Diffusion LoRA 기반 얼굴 identity preservation을 위한 훈련 코드입니다. MTCNN face detection, torchreid person re-identification, CLIP text alignment를 사용하여 개인화된 이미지 생성 모델을 학습합니다.
 
