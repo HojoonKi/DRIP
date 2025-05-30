@@ -21,6 +21,8 @@ import numpy as np
 # ----------------------------
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--mode", type=str, default="train", choices=["train", "inference"],
+                   help="실행 모드: train 또는 inference")
     p.add_argument("--data_root",   type=str, default="dataset")
     p.add_argument("--pretrained_model", type=str,
                    default="runwayml/stable-diffusion-v1-5")
@@ -31,6 +33,19 @@ def parse_args():
     p.add_argument("--l_face",     type=float, default=1.0)   # λ₁
     p.add_argument("--l_text",     type=float, default=1.0)   # λ₂
     p.add_argument("--save_dir",   type=str, default="lora_out")
+    
+    # Inference 관련 옵션들
+    p.add_argument("--lora_path", type=str, default=None,
+                   help="inference시 로드할 LoRA 가중치 경로")
+    p.add_argument("--output_dir", type=str, default="inference_output",
+                   help="inference 결과 저장 경로")
+    p.add_argument("--num_inference_steps", type=int, default=50,
+                   help="inference시 diffusion steps 수")
+    p.add_argument("--guidance_scale", type=float, default=7.5,
+                   help="classifier-free guidance scale")
+    p.add_argument("--strength", type=float, default=0.8,
+                   help="img2img strength (0.0-1.0)")
+    
     return p.parse_args()
 
 # ----------------------------
@@ -64,6 +79,47 @@ class FaceTextDataset(Dataset):
             "ref"   : self.img_tf(Image.open(s["ref"]).convert("RGB")),
             "orig"  : self.img_tf(Image.open(s["orig"]).convert("RGB")),
             "prompt": s["prompt"]
+        }
+
+class InferenceDataset(Dataset):
+    """
+    Inference용 데이터셋 
+    각 샘플은 참조 얼굴, 타겟 이미지, 프롬프트로 구성
+    """
+    def __init__(self, root, size):
+        self.samples = []
+        self.size = size
+        
+        for sample_id in sorted(os.listdir(root)):
+            folder = os.path.join(root, sample_id)
+            if os.path.isdir(folder):
+                sample = {
+                    "ref_face": os.path.join(folder, "ref_face.jpg"),
+                    "target_img": os.path.join(folder, "target_img.jpg"), 
+                    "prompt": open(os.path.join(folder, "prompt.txt")).read().strip(),
+                    "sample_id": sample_id
+                }
+                # 모든 필수 파일이 존재하는지 확인
+                if all(os.path.exists(sample[key]) for key in ["ref_face", "target_img"]):
+                    self.samples.append(sample)
+        
+        self.img_tf = transforms.Compose([
+            transforms.Resize(size, Image.BILINEAR),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])  # [-1,1] 범위
+        ])
+
+    def __len__(self): 
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        return {
+            "ref_face": self.img_tf(Image.open(s["ref_face"]).convert("RGB")),
+            "target_img": self.img_tf(Image.open(s["target_img"]).convert("RGB")),
+            "prompt": s["prompt"],
+            "sample_id": s["sample_id"]
         }
 
 # ----------------------------
@@ -117,10 +173,81 @@ def crop_face_batch(images, mtcnn_detector, target_size=160):
     return torch.stack(cropped_faces).to(device)
 
 # ----------------------------
-# 3) 메인 학습 루프
+# 4) Inference 함수
 # ----------------------------
-def main():
-    args = parse_args()
+def run_inference(args):
+    """
+    Inference 모드: 학습된 LoRA 가중치를 사용하여 이미지 생성
+    """
+    print("🚀 Starting inference mode...")
+    
+    if args.lora_path is None:
+        raise ValueError("--lora_path must be specified for inference mode")
+    
+    # 출력 디렉토리 생성
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Stable Diffusion 파이프라인 초기화
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        args.pretrained_model, 
+        torch_dtype=torch.float16,
+        safety_checker=None
+    )
+    pipe.enable_vae_tiling()
+    
+    # LoRA 가중치 로드
+    print(f"📦 Loading LoRA weights from {args.lora_path}")
+    pipe.unet.load_adapter(args.lora_path)
+    pipe = pipe.to("cuda")
+    
+    # Inference 데이터셋 로드
+    print(f"📁 Loading inference dataset from {args.data_root}")
+    dataset = InferenceDataset(args.data_root, args.resolution)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2)
+    
+    print(f"🎯 Found {len(dataset)} samples for inference")
+    
+    # Inference 실행
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            ref_face = batch["ref_face"][0]      # (C, H, W)
+            target_img = batch["target_img"][0]  # (C, H, W)
+            prompt = batch["prompt"][0]
+            sample_id = batch["sample_id"][0]
+            
+            print(f"🖼️  Processing sample {i+1}/{len(dataset)}: {sample_id}")
+            print(f"    Prompt: {prompt}")
+            
+            # [-1,1] 범위를 [0,1] 범위로 변환 후 PIL Image로 변환
+            target_pil = transforms.ToPILImage()(target_img * 0.5 + 0.5)
+            
+            # img2img 생성
+            generated_images = pipe(
+                prompt=prompt,
+                image=target_pil,
+                strength=args.strength,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                num_images_per_prompt=1
+            ).images
+            
+            # 결과 저장
+            output_path = os.path.join(args.output_dir, f"{sample_id}_generated.jpg")
+            generated_images[0].save(output_path)
+            
+            # 비교용 원본 이미지들도 저장
+            ref_face_pil = transforms.ToPILImage()(ref_face * 0.5 + 0.5)
+            ref_face_pil.save(os.path.join(args.output_dir, f"{sample_id}_ref_face.jpg"))
+            target_pil.save(os.path.join(args.output_dir, f"{sample_id}_target.jpg"))
+            
+            print(f"    ✅ Saved: {output_path}")
+    
+    print(f"🎉 Inference completed! Results saved in {args.output_dir}")
+
+# ----------------------------
+# 5) 메인 학습 루프
+# ----------------------------
+def train_main(args):
     accelerator = Accelerator(gradient_accumulation_steps=1)
 
     # (a) Stable Diffusion img2img 파이프 구성
@@ -316,6 +443,18 @@ def main():
         if accelerator.is_main_process:
             os.makedirs(args.save_dir, exist_ok=True)
             unet_lora.save_pretrained(os.path.join(args.save_dir, f"epoch{epoch:02d}"))
+
+def main():
+    args = parse_args()
+    
+    if args.mode == "train":
+        print("🏋️ Starting training mode...")
+        train_main(args)
+    elif args.mode == "inference":
+        print("🎯 Starting inference mode...")
+        run_inference(args)
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}")
 
 if __name__ == "__main__":
     main()
