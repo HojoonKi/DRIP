@@ -321,3 +321,81 @@ MIT License
 ## 🤝 기여
 
 Issue 및 Pull Request를 통한 기여를 환영합니다!
+
+#### 🌐 외부 서버 데이터 사용하기
+
+데이터가 외부 서버에 있는 경우, 다음 방법들을 사용할 수 있습니다:
+
+##### 방법 1: NFS 마운트 (권장)
+
+```bash
+# 1. 호스트에서 NFS 마운트
+sudo mkdir -p /mnt/external_data
+sudo mount -t nfs [서버IP]:[경로] /mnt/external_data
+
+# 예시
+sudo mount -t nfs 192.168.1.100:/data/datasets /mnt/external_data
+
+# 2. 도커 실행 시 마운트된 경로 연결
+docker run --gpus all -it --rm \
+    -v $(pwd):/workspace \
+    -v /mnt/external_data:/workspace/dataset \
+    drip:latest bash
+```
+
+##### 방법 2: SSHFS 마운트
+
+```bash
+# 1. sshfs 설치 (Ubuntu/Debian)
+sudo apt-get install sshfs
+
+# 2. 마운트 디렉토리 생성
+mkdir -p /mnt/external_data
+
+# 3. SSHFS로 마운트
+sshfs username@server_ip:/path/to/data /mnt/external_data
+
+# 예시
+sshfs user@192.168.1.100:/data/datasets /mnt/external_data
+
+# 4. 도커 실행 시 연결
+docker run --gpus all -it --rm \
+    -v $(pwd):/workspace \
+    -v /mnt/external_data:/workspace/dataset \
+    drip:latest bash
+```
+
+##### 방법 3: SMB/CIFS 마운트
+
+```bash
+# 1. cifs-utils 설치
+sudo apt-get install cifs-utils
+
+# 2. SMB 마운트
+sudo mkdir -p /mnt/external_data
+sudo mount -t cifs //[서버IP]/[공유폴더] /mnt/external_data -o username=[사용자명]
+
+# 예시
+sudo mount -t cifs //192.168.1.100/datasets /mnt/external_data -o username=user
+```
+
+##### 자동 마운트 설정 (선택사항)
+
+영구적으로 마운트하려면 `/etc/fstab`에 추가:
+
+```bash
+# /etc/fstab에 추가 (NFS 예시)
+192.168.1.100:/data/datasets /mnt/external_data nfs defaults 0 0
+
+# 또는 SSHFS 예시 (더 복잡함, 권장하지 않음)
+```
+
+##### 마운트 해제
+
+```bash
+# 마운트 해제
+sudo umount /mnt/external_data
+
+# SSHFS의 경우
+fusermount -u /mnt/external_data
+```

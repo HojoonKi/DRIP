@@ -1,4 +1,5 @@
 import os, math, random, argparse, torch, torch.nn.functional as F
+import glob
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
@@ -15,6 +16,7 @@ import torchreid
 from accelerate import Accelerator
 from facenet_pytorch import MTCNN
 import numpy as np
+from datasets import load_dataset
 
 # ----------------------------
 # 1) 하이퍼파라미터 & 인자
@@ -46,11 +48,80 @@ def parse_args():
     p.add_argument("--strength", type=float, default=0.8,
                    help="img2img strength (0.0-1.0)")
     
+    # 데이터셋 관련 옵션들
+    p.add_argument("--celeba_dir", type=str,
+               default="dataset/celeba-hq/celeba-512",
+               help="CelebA-HQ 256px 얼굴 이미지 폴더")
+    p.add_argument("--mpii_split", type=str, default="train",
+               choices=["train", "validation", "test"],
+               help="MPII 데이터셋 split")
+    
     return p.parse_args()
 
 # ----------------------------
 # 2) 데이터셋
 # ----------------------------
+
+class MixedFacePoseDataset(Dataset):
+    """
+    CelebA 얼굴 ↔ MPII 사람 이미지·캡션을 매 스텝 랜덤 매칭
+    반환: ref(얼굴), orig(사람+배경), prompt(캡션)
+    """
+    def __init__(self, celeba_dir, mp_split, size):
+        self.size = size
+
+        # 1) 얼굴 파일 리스트
+        self.face_paths = glob.glob(os.path.join(celeba_dir, "*.jpg"))
+        assert len(self.face_paths) > 0, f"No jpg in {celeba_dir}"
+
+        # 2) MPII 이미지+캡션 로드 (🤗)
+        print("Loading MPII dataset...")
+        ds = load_dataset("saifkhichi96/mpii-human-pose-captions", split=mp_split)
+        self.mpii_data = ds  # Store the whole dataset
+        self.mpii_caps = ds["description"]   # str - descriptions
+        assert len(self.mpii_data) > 0
+
+        # 3) 공통 transform
+        self.tf = transforms.Compose([
+            transforms.Resize(size, Image.BILINEAR),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])   # [-1,1]
+        ])
+
+    def __len__(self):
+        return len(self.mpii_data)
+
+    def __getitem__(self, idx):
+        # (a) 사람 이미지 & 텍스트
+        sample = self.mpii_data[idx]
+        
+        # Handle the image - it might be a PIL Image or need to be loaded
+        img_data = sample["image"]
+        if isinstance(img_data, str):
+            # If it's a filename, we need to handle it (this shouldn't happen with this dataset)
+            print(f"Warning: Got filename instead of PIL Image: {img_data}")
+            # You might need to adjust this path based on where images are stored
+            orig_pil = Image.open(img_data).convert("RGB")
+        elif hasattr(img_data, 'convert'):
+            # It's already a PIL Image
+            orig_pil = img_data.convert("RGB")
+        else:
+            # Convert from numpy array or other format to PIL
+            orig_pil = Image.fromarray(img_data).convert("RGB")
+        
+        prompt = sample["description"]
+
+        # (b) 같은 배치 안에서 얼굴은 **아무 이미지 하나 랜덤** 선택
+        face_path = random.choice(self.face_paths)
+        ref_pil = Image.open(face_path).convert("RGB")
+
+        return {
+            "ref": self.tf(ref_pil),
+            "orig": self.tf(orig_pil),
+            "prompt": prompt
+        }
+        
 class FaceTextDataset(Dataset):
     def __init__(self, root, size):
         self.samples = []
@@ -336,7 +407,7 @@ def train_main(args):
     optimizer = torch.optim.AdamW(unet_lora.parameters(), lr=args.lr)
 
     # (f) 데이터
-    dataset  = FaceTextDataset(args.data_root, args.resolution)
+    dataset  = MixedFacePoseDataset(args.celeba_dir, args.mpii_split, args.resolution)
     loader   = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     unet_lora, clip_model, optimizer, loader = accelerator.prepare(
         unet_lora, clip_model, optimizer, loader

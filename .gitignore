@@ -172,3 +172,20 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Dataset directories (mounted volumes)
+dataset/
+data/
+datasets/
+
+# Model checkpoints and outputs
+checkpoints/
+outputs/
+logs/
+runs/
+wandb/
+
+# Cache directories
+.cache/
+__pycache__/
+*.pyc
