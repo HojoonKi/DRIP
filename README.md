@@ -30,7 +30,7 @@ docker build -t drip:latest .
 
 ### 2. 데이터셋 준비
 
-훈련용 데이터셋을 다음 구조로 준비하세요:
+~~훈련용 데이터셋을 다음 구조로 준비하세요:~~
 
 ```
 dataset/
@@ -231,15 +231,14 @@ python train.py \
 
 ## 📊 손실 함수
 
-총 손실은 다음 세 가지 구성요소로 이루어집니다:
+- 총 손실은 다음 두 가지 구성요소로 이루어집니다:
 
-```
-L_total = λ₁ × L_face + λ₂ × L_text + 0.1 × L_recon
+```text
+L_total = λ₁ × L_face + λ₂ × L_text
 ```
 
 - **L_face**: torchreid를 통한 얼굴 identity 보존 손실
-- **L_text**: CLIP을 통한 텍스트-이미지 정렬 손실  
-- **L_recon**: Stable Diffusion의 기본 reconstruction 손실
+- **L_text**: CLIP을 통한 텍스트-이미지 정렬 손실
 
 ## 📁 출력 파일
 

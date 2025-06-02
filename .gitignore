@@ -184,6 +184,8 @@ outputs/
 logs/
 runs/
 wandb/
+lora_out/
+test_run/
 
 # Cache directories
 .cache/

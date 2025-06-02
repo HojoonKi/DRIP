@@ -44,7 +44,7 @@ RUN conda run -n drip pip install --retries 5 --timeout 60 \
         torchreid==0.2.5 timm pillow einops
 
 RUN conda run -n drip pip install --retries 5 --timeout 60 \
-        facenet-pytorch datasets huggingface-hub
+        facenet-pytorch huggingface-hub
 
 RUN conda run -n drip pip install --retries 5 --timeout 60 \
         scipy matplotlib h5py opencv-python opencv-python-headless

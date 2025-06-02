@@ -1,8 +1,14 @@
 import os, math, random, argparse, torch, torch.nn.functional as F
 import glob
+import json
+import csv
+import copy
+from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
+from tqdm import tqdm
+from tqdm import tqdm
 from diffusers import (
     StableDiffusionImg2ImgPipeline,
     AutoencoderKL,
@@ -16,7 +22,7 @@ import torchreid
 from accelerate import Accelerator
 from facenet_pytorch import MTCNN
 import numpy as np
-from datasets import load_dataset
+import copy
 
 # ----------------------------
 # 1) 하이퍼파라미터 & 인자
@@ -34,6 +40,7 @@ def parse_args():
     p.add_argument("--epochs",     type=int, default=3)
     p.add_argument("--l_face",     type=float, default=1.0)   # λ₁
     p.add_argument("--l_text",     type=float, default=1.0)   # λ₂
+    p.add_argument("--l_kl",       type=float, default=0.1)   # λ₃, KL divergence weight
     p.add_argument("--save_dir",   type=str, default="lora_out")
     
     # Inference 관련 옵션들
@@ -50,11 +57,11 @@ def parse_args():
     
     # 데이터셋 관련 옵션들
     p.add_argument("--celeba_dir", type=str,
-               default="dataset/celeba-hq/celeba-512",
+               default="dataset/celeba-hq/celeba-256",
                help="CelebA-HQ 256px 얼굴 이미지 폴더")
-    p.add_argument("--mpii_split", type=str, default="train",
-               choices=["train", "validation", "test"],
-               help="MPII 데이터셋 split")
+    p.add_argument("--mpii_dir", type=str, 
+               default="dataset/mpii-one-person",
+               help="MPII 데이터셋 루트 디렉토리")
     
     return p.parse_args()
 
@@ -67,19 +74,33 @@ class MixedFacePoseDataset(Dataset):
     CelebA 얼굴 ↔ MPII 사람 이미지·캡션을 매 스텝 랜덤 매칭
     반환: ref(얼굴), orig(사람+배경), prompt(캡션)
     """
-    def __init__(self, celeba_dir, mp_split, size):
+    def __init__(self, celeba_dir, mpii_dir, size):
         self.size = size
 
         # 1) 얼굴 파일 리스트
         self.face_paths = glob.glob(os.path.join(celeba_dir, "*.jpg"))
         assert len(self.face_paths) > 0, f"No jpg in {celeba_dir}"
 
-        # 2) MPII 이미지+캡션 로드 (🤗)
+        # 2) MPII 이미지+캡션 로드 (로컬 JSON)
         print("Loading MPII dataset...")
-        ds = load_dataset("saifkhichi96/mpii-human-pose-captions", split=mp_split)
-        self.mpii_data = ds  # Store the whole dataset
-        self.mpii_caps = ds["description"]   # str - descriptions
-        assert len(self.mpii_data) > 0
+        annotations_file = os.path.join(mpii_dir, "mpii_annotations.json")
+        images_dir = os.path.join(mpii_dir, "mpii_images")
+        
+        with open(annotations_file, 'r') as f:
+            annotations = json.load(f)
+        
+        self.mpii_data = []
+        for annotation in annotations["image_annotations"]:
+            if "image" in annotation:  # 이미지 필드가 있는 항목만 처리
+                image_path = os.path.join(images_dir, annotation["image"])
+                if os.path.exists(image_path):
+                    self.mpii_data.append({
+                        "image_path": image_path,
+                        "description": annotation["description"]
+                    })
+        
+        assert len(self.mpii_data) > 0, f"No valid MPII images found in {images_dir}"
+        print(f"Loaded {len(self.mpii_data)} MPII samples")
 
         # 3) 공통 transform
         self.tf = transforms.Compose([
@@ -95,22 +116,11 @@ class MixedFacePoseDataset(Dataset):
     def __getitem__(self, idx):
         # (a) 사람 이미지 & 텍스트
         sample = self.mpii_data[idx]
-        
-        # Handle the image - it might be a PIL Image or need to be loaded
-        img_data = sample["image"]
-        if isinstance(img_data, str):
-            # If it's a filename, we need to handle it (this shouldn't happen with this dataset)
-            print(f"Warning: Got filename instead of PIL Image: {img_data}")
-            # You might need to adjust this path based on where images are stored
-            orig_pil = Image.open(img_data).convert("RGB")
-        elif hasattr(img_data, 'convert'):
-            # It's already a PIL Image
-            orig_pil = img_data.convert("RGB")
-        else:
-            # Convert from numpy array or other format to PIL
-            orig_pil = Image.fromarray(img_data).convert("RGB")
-        
+        image_path = sample["image_path"]
         prompt = sample["description"]
+        
+        # 이미지 로드
+        orig_pil = Image.open(image_path).convert("RGB")
 
         # (b) 같은 배치 안에서 얼굴은 **아무 이미지 하나 랜덤** 선택
         face_path = random.choice(self.face_paths)
@@ -266,6 +276,20 @@ def run_inference(args):
     )
     pipe.enable_vae_tiling()
     
+    # UNet의 conv_in을 8채널로 수정 (training과 동일하게)
+    unet = pipe.unet
+    if unet.conv_in.in_channels == 4:
+        old_weight = unet.conv_in.weight.data
+        new_conv_in = torch.nn.Conv2d(8, old_weight.shape[0], 
+                                       kernel_size=old_weight.shape[2:], 
+                                       stride=unet.conv_in.stride,
+                                       padding=unet.conv_in.padding)
+        with torch.no_grad():
+            new_conv_in.weight[:, :4] = old_weight
+            new_conv_in.weight[:, 4:] = old_weight * 0.1
+            new_conv_in.bias = unet.conv_in.bias
+        unet.conv_in = new_conv_in.to(old_weight.device, dtype=old_weight.dtype)
+    
     # LoRA 가중치 로드
     print(f"📦 Loading LoRA weights from {args.lora_path}")
     pipe.unet.load_adapter(args.lora_path)
@@ -278,7 +302,7 @@ def run_inference(args):
     
     print(f"🎯 Found {len(dataset)} samples for inference")
     
-    # Inference 실행
+    # 커스텀 inference 루프 (reference image 통합)
     with torch.no_grad():
         for i, batch in enumerate(loader):
             ref_face = batch["ref_face"][0]      # (C, H, W)
@@ -289,25 +313,85 @@ def run_inference(args):
             print(f"🖼️  Processing sample {i+1}/{len(dataset)}: {sample_id}")
             print(f"    Prompt: {prompt}")
             
-            # [-1,1] 범위를 [0,1] 범위로 변환 후 PIL Image로 변환
-            target_pil = transforms.ToPILImage()(target_img * 0.5 + 0.5)
+            # 배치 차원 추가
+            ref_batch = ref_face.unsqueeze(0).to("cuda")    # (1, C, H, W)
+            target_batch = target_img.unsqueeze(0).to("cuda")  # (1, C, H, W)
             
-            # img2img 생성
-            generated_images = pipe(
-                prompt=prompt,
-                image=target_pil,
-                strength=args.strength,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                num_images_per_prompt=1
-            ).images
+            # latent space로 인코딩
+            target_latents = pipe.vae.encode(target_batch.half()).latent_dist.sample()
+            target_latents = target_latents * pipe.vae.config.scaling_factor
+            
+            ref_latents = pipe.vae.encode(ref_batch.half()).latent_dist.sample()
+            ref_latents = ref_latents * pipe.vae.config.scaling_factor
+            
+            # text embeddings
+            text_inputs = pipe.tokenizer(
+                [prompt], padding="max_length",
+                max_length=pipe.tokenizer.model_max_length,
+                truncation=True, return_tensors="pt"
+            ).to("cuda")
+            text_embeddings = pipe.text_encoder(**text_inputs)[0]
+            
+            # unconditioned embeddings for classifier-free guidance
+            uncond_inputs = pipe.tokenizer(
+                [""], padding="max_length",
+                max_length=pipe.tokenizer.model_max_length,
+                truncation=True, return_tensors="pt"
+            ).to("cuda")
+            uncond_embeddings = pipe.text_encoder(**uncond_inputs)[0]
+            
+            # guidance를 위해 concatenate
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            
+            # noise scheduler 초기화
+            pipe.scheduler.set_timesteps(args.num_inference_steps)
+            timesteps = pipe.scheduler.timesteps
+            
+            # 초기 noise로 시작 (img2img이므로 부분적으로 noise)
+            noise = torch.randn_like(target_latents)
+            init_timestep = min(int(args.num_inference_steps * args.strength), args.num_inference_steps)
+            t_start = max(args.num_inference_steps - init_timestep, 0)
+            
+            # target latent에 noise 추가
+            latents = pipe.scheduler.add_noise(target_latents, noise, timesteps[t_start:t_start+1])
+            
+            # denoising loop
+            for i, t in enumerate(timesteps[t_start:]):
+                # latent concatenation: [noisy_target, clean_ref]
+                latent_model_input = torch.cat([latents, ref_latents], dim=1)
+                
+                # classifier-free guidance를 위해 복제
+                latent_model_input = torch.cat([latent_model_input] * 2)
+                latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
+                
+                # UNet으로 noise prediction
+                noise_pred = pipe.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings
+                ).sample
+                
+                # classifier-free guidance
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # 다음 step을 위한 latent 업데이트
+                latents = pipe.scheduler.step(noise_pred, t, latents).prev_sample
+            
+            # latent을 이미지로 디코딩
+            generated_image = pipe.vae.decode((latents / pipe.vae.config.scaling_factor).half()).sample
+            generated_image = torch.clamp(generated_image, -1, 1)
+            
+            # [-1,1] 범위를 [0,1] 범위로 변환 후 PIL Image로 변환
+            generated_pil = transforms.ToPILImage()(generated_image[0] * 0.5 + 0.5)
+            target_pil = transforms.ToPILImage()(target_img * 0.5 + 0.5)
+            ref_face_pil = transforms.ToPILImage()(ref_face * 0.5 + 0.5)
             
             # 결과 저장
             output_path = os.path.join(args.output_dir, f"{sample_id}_generated.jpg")
-            generated_images[0].save(output_path)
+            generated_pil.save(output_path)
             
             # 비교용 원본 이미지들도 저장
-            ref_face_pil = transforms.ToPILImage()(ref_face * 0.5 + 0.5)
             ref_face_pil.save(os.path.join(args.output_dir, f"{sample_id}_ref_face.jpg"))
             target_pil.save(os.path.join(args.output_dir, f"{sample_id}_target.jpg"))
             
@@ -330,6 +414,26 @@ def train_main(args):
 
     # LoRA 주입 (UNet cross-attention 만)
     unet = pipe.unet
+    
+    # UNet의 conv_in을 8채널로 수정 (reference image concatenation을 위해)
+    if unet.conv_in.in_channels == 4:
+        print("🔧 Modifying UNet conv_in from 4 to 8 channels for reference image integration...")
+        old_weight = unet.conv_in.weight.data
+        new_conv_in = torch.nn.Conv2d(8, old_weight.shape[0], 
+                                       kernel_size=old_weight.shape[2:], 
+                                       stride=unet.conv_in.stride,
+                                       padding=unet.conv_in.padding)
+        with torch.no_grad():
+            new_conv_in.weight[:, :4] = old_weight
+            new_conv_in.weight[:, 4:] = old_weight * 0.1  # reference weight는 작게 시작
+            new_conv_in.bias = unet.conv_in.bias
+        unet.conv_in = new_conv_in.to(old_weight.device, dtype=old_weight.dtype)
+    
+    # KL Loss 계산을 위해 원본 UNet 복사 (conv_in 수정 후에)
+    unet_original = copy.deepcopy(unet) 
+    unet_original = unet_original.to(accelerator.device) # 원본 UNet을 올바른 디바이스로 이동
+    for p in unet_original.parameters(): p.requires_grad_(False) # 원본 UNet은 freeze
+    
     lora_config = LoraConfig(
         r=8, lora_alpha=16, target_modules=["to_q", "to_k", "to_v", "to_out.0"],
         bias="none", modules_to_save=None
@@ -362,11 +466,14 @@ def train_main(args):
         """
         torchreid 모델을 사용한 feature extraction
         Args:
-            images: torch.Tensor (B, C, H, W), 값 범위 [0, 1]
+            images: torch.Tensor (B, C, H, W), 값 범위 [-1, 1]
         Returns:
             features: torch.Tensor (B, feature_dim)
         """
         with torch.no_grad():
+            # [-1,1] 범위를 [0,1] 범위로 변환
+            images_norm = images * 0.5 + 0.5
+            
             # torchreid는 ImageNet 정규화를 사용
             normalize = transforms.Normalize(
                 mean=[0.485, 0.456, 0.406], 
@@ -382,8 +489,8 @@ def train_main(args):
             features = []
             
             for i in range(batch_size):
-                img = resize_transform(images[i])
-                img = img.unsqueeze(0)  # (1, C, H, W)
+                img = resize_transform(images_norm[i])
+                img = img.unsqueeze(0).to(images.device)  # (1, C, H, W)
                 
                 # feature extraction
                 feat = reid_model(img)
@@ -407,36 +514,86 @@ def train_main(args):
     optimizer = torch.optim.AdamW(unet_lora.parameters(), lr=args.lr)
 
     # (f) 데이터
-    dataset  = MixedFacePoseDataset(args.celeba_dir, args.mpii_split, args.resolution)
+    dataset  = MixedFacePoseDataset(args.celeba_dir, args.mpii_dir, args.resolution)
     loader   = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    
+    # accelerator.prepare로 모든 컴포넌트를 준비
     unet_lora, clip_model, optimizer, loader = accelerator.prepare(
         unet_lora, clip_model, optimizer, loader
     )
+    
+    # VAE, text_encoder, tokenizer도 같은 디바이스로 이동
+    pipe.vae = pipe.vae.to(accelerator.device)
+    pipe.text_encoder = pipe.text_encoder.to(accelerator.device)
+    
+    # 디바이스 확인 로그
+    print(f"🖥️  Device info:")
+    print(f"   Accelerator device: {accelerator.device}")
+    print(f"   UNet device: {next(unet_lora.parameters()).device}")
+    print(f"   VAE device: {next(pipe.vae.parameters()).device}")
+    print(f"   CLIP device: {next(clip_model.parameters()).device}")
+    print(f"   ReID device: {next(reid_model.parameters()).device}")
 
     # 스케줄러 – SD 훈련과 동일(DDPM)
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2"
     )
 
+    # 로그 파일 설정
+    if accelerator.is_main_process:
+        log_dir = os.path.join(args.save_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        
+        # CSV 헤더 작성
+        with open(log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'epoch', 'global_step', 'loss_face', 'loss_text', 'loss_kl', 'total_loss'])
+        
+        print(f"📝 Training log will be saved to: {log_file}")
+
     global_step = 0
-    for epoch in range(args.epochs):
+    for epoch in tqdm(range(args.epochs), desc="Epochs", position=0):
         unet_lora.train()
-        for batch in loader:
+        
+        # Create progress bar for batches
+        batch_pbar = tqdm(loader, 
+                         desc=f"Epoch {epoch+1}/{args.epochs}", 
+                         position=1, 
+                         leave=False)
+        
+        for batch in batch_pbar:
             with accelerator.accumulate(unet_lora):
                 orig = batch["orig"]      # (B,3,H,W)   [-1,1]
                 ref  = batch["ref"]       # (B,3,H,W)
                 prompts = batch["prompt"]
+                
+                # 데이터를 올바른 디바이스로 이동
+                orig = orig.to(accelerator.device)
+                ref = ref.to(accelerator.device)
 
                 # ---------- ➊ SD forward/backward ----------
-                # encode 원본 → latent
-                latents = pipe.vae.encode(orig).latent_dist.sample()
+                # encode 원본 → latent (VAE는 float16이므로 입력도 맞춰줌)
+                latents = pipe.vae.encode(orig.half()).latent_dist.sample()
                 latents = latents * pipe.vae.config.scaling_factor
+                
+                # encode reference image → latent
+                ref_latents = pipe.vae.encode(ref.half()).latent_dist.sample()
+                ref_latents = ref_latents * pipe.vae.config.scaling_factor
 
                 bsz = latents.shape[0]
                 t = torch.randint(0, noise_scheduler.num_train_timesteps,
                                   (bsz,), device=latents.device).long()
                 noise = torch.randn_like(latents)
+                ref_noise = torch.randn_like(ref_latents)
+                
+                # 둘 다 같은 timestep으로 noise 추가
                 noisy_latents = noise_scheduler.add_noise(latents, noise, t)
+                noisy_ref_latents = noise_scheduler.add_noise(ref_latents, ref_noise, t)
+                
+                # latent concatenation: [noisy_original, noisy_ref] 
+                # 채널 축(dim=1)으로 concatenate
+                combined_latents = torch.cat([noisy_latents, noisy_ref_latents], dim=1)
 
                 # text embeddings
                 text_inputs = pipe.tokenizer(
@@ -446,21 +603,18 @@ def train_main(args):
                 ).to(latents.device)
                 text_embeddings = pipe.text_encoder(**text_inputs)[0]
 
-                # UNet forward
+                # UNet forward with concatenated latents
                 noise_pred = unet_lora(
-                    noisy_latents,
+                    combined_latents,
                     t,
                     encoder_hidden_states=text_embeddings
                 ).sample
-
-                # simple MSE loss between pred & true noise (optional, small weight)
-                loss_recon = F.mse_loss(noise_pred.float(), noise.float())
 
                 # ---------- ➋ 이미지 재생성(한 스텝만 반전) ----------
                 with torch.no_grad():
                     denoised_latents = noisy_latents - noise_pred
                     imgs_gen = pipe.vae.decode(
-                        denoised_latents / pipe.vae.config.scaling_factor).sample
+                        (denoised_latents / pipe.vae.config.scaling_factor).half()).sample
                 imgs_gen = torch.clamp(imgs_gen, -1, 1)
 
                 # ---------- ➌ CLIP-ReID 얼굴 손실 ----------
@@ -474,46 +628,105 @@ def train_main(args):
                     ref_faces = crop_face_batch(ref_imgs_norm, mtcnn_detector, target_size=224)
                     gen_faces = crop_face_batch(gen_imgs_norm, mtcnn_detector, target_size=224)
                 
-                # ReID feature extraction을 위해 다시 [-1,1] 범위로 변환
+                # ReID feature extraction을 위해 [0,1] → [-1,1] 범위로 변환
                 ref_faces_reid = ref_faces * 2.0 - 1.0  # [0,1] → [-1,1]
                 gen_faces_reid = gen_faces * 2.0 - 1.0  # [0,1] → [-1,1]
                 
                 # CLIP-ReID 특징 추출 (crop된 얼굴 사용)
-                ref_feats = extract_reid_features(ref_faces_reid.half())   # (B, 512)
-                gen_feats = extract_reid_features(gen_faces_reid.half())   # (B, 512)
+                ref_feats = extract_reid_features(ref_faces_reid)   # (B, 512)
+                gen_feats = extract_reid_features(gen_faces_reid)   # (B, 512)
                 sim_face  = F.cosine_similarity(ref_feats, gen_feats, dim=1)
                 loss_face = (1 - sim_face).mean()      # 높을수록 좋으니 1-cosine
 
                 # ---------- ➍ CLIP 텍스트 손실 ----------
+                # 생성된 이미지를 PIL Image 형태로 변환 (CLIP processor용)
+                gen_images_pil = []
+                for g in imgs_gen:
+                    img_pil = transforms.ToPILImage()(g * 0.5 + 0.5)
+                    gen_images_pil.append(img_pil)
+                
                 clip_inputs = clip_processor(
                     text=list(prompts),
-                    images=[(g * 0.5 + 0.5) for g in imgs_gen],
+                    images=gen_images_pil,
                     return_tensors="pt",
                     padding=True
-                ).to(latents.device)
+                )
+                
+                # CLIP 입력을 올바른 디바이스로 이동
+                clip_inputs = {k: v.to(accelerator.device) if isinstance(v, torch.Tensor) else v 
+                             for k, v in clip_inputs.items()}
 
-                img_emb = clip_model.get_image_features(clip_inputs.pixel_values)
-                txt_emb = clip_model.get_text_features(clip_inputs.input_ids,
-                                                       attention_mask=clip_inputs.attention_mask)
+                img_emb = clip_model.get_image_features(clip_inputs['pixel_values'])
+                txt_emb = clip_model.get_text_features(clip_inputs['input_ids'],
+                                                       attention_mask=clip_inputs.get('attention_mask', None))
                 img_emb, txt_emb = F.normalize(img_emb, dim=-1), F.normalize(txt_emb, dim=-1)
                 sim_text = (img_emb * txt_emb).sum(-1)
                 loss_text = (1 - sim_text).mean()
 
                 # ---------- ➎ 총 손실 ----------
-                loss = args.l_face * loss_face + args.l_text * loss_text + 0.1 * loss_recon
+                # KL divergence loss 계산 (안정적인 버전)
+                with torch.no_grad():
+                    original_output = unet_original(
+                        combined_latents,
+                        t,
+                        encoder_hidden_states=text_embeddings
+                    ).sample
+                
+                # 안정적인 KL divergence 계산
+                # 1) 값들을 clamp해서 극값 방지
+                noise_pred_clamped = torch.clamp(noise_pred, -10, 10)
+                original_output_clamped = torch.clamp(original_output, -10, 10)
+                
+                # 2) temperature scaling으로 분포를 부드럽게 만듦
+                temperature = 2.0
+                log_p = F.log_softmax(noise_pred_clamped / temperature, dim=1)
+                q = F.softmax(original_output_clamped / temperature, dim=1)
+                
+                # 3) KL divergence 계산 (안정적인 버전)
+                kl_div = F.kl_div(log_p, q, reduction='batchmean')
+                
+                # 4) NaN 체크 및 처리
+                if torch.isnan(kl_div) or torch.isinf(kl_div):
+                    # print(f"⚠️  KL divergence is {kl_div.item()}, setting to 0")
+                    kl_div = torch.tensor(0.0, device=kl_div.device, requires_grad=True)
+                
+                # 총 손실 계산
+                loss = args.l_face * loss_face + args.l_text * loss_text + args.l_kl * kl_div
                 accelerator.backward(loss)
                 optimizer.step(); optimizer.zero_grad()
 
                 global_step += 1
-                if accelerator.is_main_process and global_step % 50 == 0:
-                    print(f"step {global_step:05d} | "
-                          f"L_face {loss_face.item():.3f} "
-                          f"L_text {loss_text.item():.3f}")
+                
+                # Update progress bar with current loss values
+                if global_step % 10 == 0:
+                    batch_pbar.set_postfix({
+                        'L_face': f'{loss_face.item():.3f}',
+                        'L_text': f'{loss_text.item():.3f}',
+                        'L_kl': f'{kl_div.item():.3f}',
+                        'total': f'{loss.item():.3f}'
+                    })
+                
+                # 1000스텝마다 로그 파일에 기록
+                if accelerator.is_main_process and global_step % 1000 == 0:
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    with open(log_file, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            timestamp,
+                            epoch + 1,
+                            global_step,
+                            f"{loss_face.item():.6f}",
+                            f"{loss_text.item():.6f}",
+                            f"{kl_div.item():.6f}",
+                            f"{loss.item():.6f}"
+                        ])
+                    print(f"📝 Logged training metrics at step {global_step} to {log_file}")
 
         # epoch-단위 LoRA 가중치 저장
         if accelerator.is_main_process:
             os.makedirs(args.save_dir, exist_ok=True)
             unet_lora.save_pretrained(os.path.join(args.save_dir, f"epoch{epoch:02d}"))
+            print(f"✅ Epoch {epoch+1} completed. LoRA weights saved to {args.save_dir}/epoch{epoch:02d}")
 
 def main():
     args = parse_args()
