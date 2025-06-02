@@ -276,19 +276,8 @@ def run_inference(args):
     )
     pipe.enable_vae_tiling()
     
-    # UNet의 conv_in을 8채널로 수정 (training과 동일하게)
-    unet = pipe.unet
-    if unet.conv_in.in_channels == 4:
-        old_weight = unet.conv_in.weight.data
-        new_conv_in = torch.nn.Conv2d(8, old_weight.shape[0], 
-                                       kernel_size=old_weight.shape[2:], 
-                                       stride=unet.conv_in.stride,
-                                       padding=unet.conv_in.padding)
-        with torch.no_grad():
-            new_conv_in.weight[:, :4] = old_weight
-            new_conv_in.weight[:, 4:] = old_weight * 0.1
-            new_conv_in.bias = unet.conv_in.bias
-        unet.conv_in = new_conv_in.to(old_weight.device, dtype=old_weight.dtype)
+    # UNet은 기본 4채널 유지 (batch concatenation 사용)
+    print("🔧 Using batch concatenation for reference image integration...")
     
     # LoRA 가중치 로드
     print(f"📦 Loading LoRA weights from {args.lora_path}")
@@ -332,6 +321,18 @@ def run_inference(args):
             ).to("cuda")
             text_embeddings = pipe.text_encoder(**text_inputs)[0]
             
+            # Reference image를 CLIP으로 인코딩하여 text embedding에 추가
+            ref_clip_inputs = clip_processor(
+                images=[transforms.ToPILImage()(ref_face * 0.5 + 0.5)],
+                return_tensors="pt",
+                padding=True
+            ).to("cuda")
+            
+            ref_img_features = clip_model.get_image_features(ref_clip_inputs['pixel_values'])
+            ref_img_features = F.normalize(ref_img_features, dim=-1)
+            ref_img_features_expanded = ref_img_features.unsqueeze(1)  # (1, 1, 768)
+            enhanced_text_embeddings = torch.cat([text_embeddings, ref_img_features_expanded], dim=1)  # (1, 78, 768)
+            
             # unconditioned embeddings for classifier-free guidance
             uncond_inputs = pipe.tokenizer(
                 [""], padding="max_length",
@@ -340,8 +341,12 @@ def run_inference(args):
             ).to("cuda")
             uncond_embeddings = pipe.text_encoder(**uncond_inputs)[0]
             
+            # uncond도 reference features 추가 (빈 reference로)
+            empty_ref_features = torch.zeros_like(ref_img_features_expanded)
+            enhanced_uncond_embeddings = torch.cat([uncond_embeddings, empty_ref_features], dim=1)
+            
             # guidance를 위해 concatenate
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_embeddings = torch.cat([enhanced_uncond_embeddings, enhanced_text_embeddings])
             
             # noise scheduler 초기화
             pipe.scheduler.set_timesteps(args.num_inference_steps)
@@ -357,14 +362,14 @@ def run_inference(args):
             
             # denoising loop
             for i, t in enumerate(timesteps[t_start:]):
-                # latent concatenation: [noisy_target, clean_ref]
-                latent_model_input = torch.cat([latents, ref_latents], dim=1)
+                # latent 입력 (메모리 효율적 - reference 없이 target만)
+                latent_model_input = latents
                 
                 # classifier-free guidance를 위해 복제
                 latent_model_input = torch.cat([latent_model_input] * 2)
                 latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
                 
-                # UNet으로 noise prediction
+                # UNet으로 noise prediction (enhanced text embeddings 사용)
                 noise_pred = pipe.unet(
                     latent_model_input,
                     t,
@@ -415,21 +420,10 @@ def train_main(args):
     # LoRA 주입 (UNet cross-attention 만)
     unet = pipe.unet
     
-    # UNet의 conv_in을 8채널로 수정 (reference image concatenation을 위해)
-    if unet.conv_in.in_channels == 4:
-        print("🔧 Modifying UNet conv_in from 4 to 8 channels for reference image integration...")
-        old_weight = unet.conv_in.weight.data
-        new_conv_in = torch.nn.Conv2d(8, old_weight.shape[0], 
-                                       kernel_size=old_weight.shape[2:], 
-                                       stride=unet.conv_in.stride,
-                                       padding=unet.conv_in.padding)
-        with torch.no_grad():
-            new_conv_in.weight[:, :4] = old_weight
-            new_conv_in.weight[:, 4:] = old_weight * 0.1  # reference weight는 작게 시작
-            new_conv_in.bias = unet.conv_in.bias
-        unet.conv_in = new_conv_in.to(old_weight.device, dtype=old_weight.dtype)
+    # UNet은 기본 4채널 유지 (batch concatenation 사용)
+    print("🔧 Using batch concatenation for reference image integration...")
     
-    # KL Loss 계산을 위해 원본 UNet 복사 (conv_in 수정 후에)
+    # KL Loss 계산을 위해 원본 UNet 복사
     unet_original = copy.deepcopy(unet) 
     unet_original = unet_original.to(accelerator.device) # 원본 UNet을 올바른 디바이스로 이동
     for p in unet_original.parameters(): p.requires_grad_(False) # 원본 UNet은 freeze
@@ -591,30 +585,87 @@ def train_main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, t)
                 noisy_ref_latents = noise_scheduler.add_noise(ref_latents, ref_noise, t)
                 
-                # latent concatenation: [noisy_original, noisy_ref] 
-                # 채널 축(dim=1)으로 concatenate
-                combined_latents = torch.cat([noisy_latents, noisy_ref_latents], dim=1)
-
+                # Reference image를 CLIP으로 인코딩하여 text embedding에 추가
+                # 먼저 reference image를 PIL로 변환
+                ref_images_pil = []
+                for ref_img in ref:
+                    ref_pil = transforms.ToPILImage()(ref_img * 0.5 + 0.5)
+                    ref_images_pil.append(ref_pil)
+                
+                # CLIP으로 reference image 인코딩
+                ref_clip_inputs = clip_processor(
+                    images=ref_images_pil,
+                    return_tensors="pt",
+                    padding=True
+                ).to(accelerator.device)
+                
+                ref_img_features = clip_model.get_image_features(ref_clip_inputs['pixel_values'])
+                ref_img_features = F.normalize(ref_img_features, dim=-1)
+                
                 # text embeddings
                 text_inputs = pipe.tokenizer(
-                    list(prompts), padding="max_length",
+                    list(prompts), 
+                    padding="max_length",
                     max_length=pipe.tokenizer.model_max_length,
                     truncation=True, return_tensors="pt"
                 ).to(latents.device)
                 text_embeddings = pipe.text_encoder(**text_inputs)[0]
+                
+                # Reference image features를 text embedding에 concatenate
+                # text_embeddings: (B, 77, 768), ref_img_features: (B, 768)
+                ref_img_features_expanded = ref_img_features.unsqueeze(1)  # (B, 1, 768)
+                enhanced_text_embeddings = torch.cat([text_embeddings, ref_img_features_expanded], dim=1)  # (B, 78, 768)
+                
+                # 데이터 타입을 UNet과 맞춤 (float16)
+                enhanced_text_embeddings = enhanced_text_embeddings.half()
 
-                # UNet forward with concatenated latents
+                # UNet forward with enhanced text embeddings (메모리 2배 증가 없음!)
                 noise_pred = unet_lora(
-                    combined_latents,
+                    noisy_latents,  # 원본 latents만 사용
                     t,
-                    encoder_hidden_states=text_embeddings
+                    encoder_hidden_states=enhanced_text_embeddings
                 ).sample
 
-                # ---------- ➋ 이미지 재생성(한 스텝만 반전) ----------
+                # ---------- ➋ 완전한 denoising으로 x0 생성 ----------
+                # 전체 denoising process를 통해 최종 이미지 생성
                 with torch.no_grad():
-                    denoised_latents = noisy_latents - noise_pred
+                    # noise scheduler로 전체 denoising 수행
+                    scheduler_temp = DDPMScheduler(
+                        num_train_timesteps=1000, 
+                        beta_schedule="squaredcos_cap_v2"
+                    )
+                    scheduler_temp.set_timesteps(50)  # inference steps
+                    
+                    # scheduler의 timesteps를 올바른 디바이스로 이동
+                    scheduler_temp.timesteps = scheduler_temp.timesteps.to(t.device)
+                    
+                    # 현재 timestep에서 시작
+                    current_latents = noisy_latents.clone()
+                    
+                    # 현재 timestep부터 0까지 denoising
+                    timesteps = scheduler_temp.timesteps.to(t.device)
+                    current_t_idx = torch.where(timesteps <= t[0])[0]
+                    if len(current_t_idx) > 0:
+                        start_idx = current_t_idx[0].item()
+                    else:
+                        start_idx = 0
+                    
+                    for step_t in timesteps[start_idx:]:
+                        # UNet prediction with enhanced text embeddings
+                        step_noise_pred = unet_lora(
+                            current_latents,
+                            step_t.unsqueeze(0).repeat(bsz).to(current_latents.device),
+                            encoder_hidden_states=enhanced_text_embeddings
+                        ).sample
+                        
+                        # scheduler step - 원본 이미지만 업데이트
+                        current_latents = scheduler_temp.step(
+                            step_noise_pred, step_t.cpu(), current_latents
+                        ).prev_sample
+                    
+                    # 최종 denoised latents를 이미지로 변환
                     imgs_gen = pipe.vae.decode(
-                        (denoised_latents / pipe.vae.config.scaling_factor).half()).sample
+                        (current_latents / pipe.vae.config.scaling_factor).half()).sample
                 imgs_gen = torch.clamp(imgs_gen, -1, 1)
 
                 # ---------- ➌ CLIP-ReID 얼굴 손실 ----------
@@ -667,9 +718,9 @@ def train_main(args):
                 # KL divergence loss 계산 (안정적인 버전)
                 with torch.no_grad():
                     original_output = unet_original(
-                        combined_latents,
+                        noisy_latents,
                         t,
-                        encoder_hidden_states=text_embeddings
+                        encoder_hidden_states=enhanced_text_embeddings
                     ).sample
                 
                 # 안정적인 KL divergence 계산
